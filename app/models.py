@@ -171,3 +171,81 @@ class ValidateResponse(BaseModel):
     first_difference_batch_id: int | None = None
     difference: DifferenceDetail | None = None
     notes: list[str] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# Publishing and reading net products
+# ---------------------------------------------------------------------------
+
+REQUEST_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+
+
+class PublishRequest(BaseModel):
+    """Publish the net product for ``initial`` replayed with ``batches``.
+
+    The submitted SQL fields of :class:`MinimizeRequest` are not needed: the
+    product is computed from the replayed source rows themselves, with the
+    same in-batch legality rules as the existing API.
+    """
+
+    request_id: str = Field(
+        ...,
+        pattern=REQUEST_ID_PATTERN,
+        description=(
+            "请求标识（幂等键），1-128 位字母/数字/._:-。同一标识重送相同内容返回"
+            "首次发布版本；内容不同则拒绝。"
+        ),
+    )
+    base_version: int = Field(
+        ...,
+        ge=0,
+        description="所见发布版本；0 表示尚无已发布成品。必须仍是当前版本才发布。",
+    )
+    initial: InitialData
+    batches: list[Batch] = Field(
+        ...,
+        min_length=1,
+        max_length=20,
+        description="顺序批次（沿用现有格式，1-20 批，批号唯一）",
+    )
+
+    @model_validator(mode="after")
+    def _unique_batches(self) -> "PublishRequest":
+        ids = [b.batch_id for b in self.batches]
+        if len(ids) != len(set(ids)):
+            raise ValueError("batch_id 必须唯一")
+        return self
+
+
+class ProductRowModel(BaseModel):
+    order_id: int
+    net_amount: int
+
+
+class PublishResponse(BaseModel):
+    version: int = Field(..., description="本次发布的版本号（幂等重放时为首次版本）")
+    replayed: bool = Field(
+        ..., description="true 表示同一请求标识与内容已发布过，未产生新版本"
+    )
+    row_count: int = Field(..., description="整份成品行数")
+    product: list[ProductRowModel] = Field(..., description="本次发布的完整净额成品")
+
+
+class ProductResponse(BaseModel):
+    version: int = Field(..., description="读到的完整版本号")
+    request_id: str = Field(..., description="发布该版本的请求标识")
+    row_count: int = Field(..., description="该版本行数")
+    published_at: str = Field(..., description="发布时刻（UTC，ISO-8601）")
+    product: list[ProductRowModel] = Field(..., description="按 order_id 升序的完整成品")
+
+
+class VersionInfoModel(BaseModel):
+    version: int
+    request_id: str
+    row_count: int
+    published_at: str
+
+
+class VersionListResponse(BaseModel):
+    current_version: int
+    versions: list[VersionInfoModel]

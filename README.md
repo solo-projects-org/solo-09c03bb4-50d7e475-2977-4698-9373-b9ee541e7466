@@ -1,8 +1,13 @@
-# 增量净额 SQL 反例精简器
+# 增量净额 SQL 反例精简器 + 净额成品发布
 
-面向结算数仓开发者的定位工具：给定 `orders`/`refunds` 初始数据、至多 20 批增删改变更、
-**全量 SELECT** 与**增量 SQL**，服务会自动找出增量维护净额表时的错误，并把导致错误的
-变更批次缩减到最小（保留原批号与原顺序），返回精简输入、首次差异批号以及缺失/多余行。
+面向结算数仓开发者的工具，提供两组能力：
+
+1. **反例精简**：给定 `orders`/`refunds` 初始数据、至多 20 批增删改变更、
+   **全量 SELECT** 与**增量 SQL**，服务会自动找出增量维护净额表时的错误，并把导致错误的
+   变更批次缩减到最小（保留原批号与原顺序），返回精简输入、首次差异批号以及缺失/多余行。
+2. **净额成品发布与读取**：提交现有格式的初态、顺序批次、所见发布版本和请求标识，
+   服务沿用批内合法性规则重放，逐订单计算 `订单金额 - 退款合计`，整份算完后原子发布
+   下一版本；下游可按当前版本或指定版本读取完整成品。
 
 ## 快速开始
 
@@ -12,6 +17,7 @@ docker compose up --build
 #    Swagger UI: http://localhost:8000/docs
 #    OpenAPI   : http://localhost:8000/openapi.json
 #    健康检查  : http://localhost:8000/health
+#    已发布成品持久化在命名卷 published-data 中（容器重建后仍在）
 
 # 2) 本地运行（Python 3.11+）
 python3 -m pip install -r requirements.txt
@@ -27,6 +33,16 @@ python3 -m pytest tests/ -q
 curl -s -X POST http://localhost:8000/v1/minimize \
      -H 'content-type: application/json' \
      --data-binary @examples/leak_refund_delete.json | python3 -m json.tool
+
+# 发布净额成品（首次：base_version=0）
+curl -s -X POST http://localhost:8000/v1/publish \
+     -H 'content-type: application/json' \
+     --data-binary @examples/publish_product.json | python3 -m json.tool
+
+# 读取当前完整成品 / 指定版本 / 版本列表
+curl -s http://localhost:8000/v1/products/current | python3 -m json.tool
+curl -s http://localhost:8000/v1/products/1 | python3 -m json.tool
+curl -s http://localhost:8000/v1/products/versions | python3 -m json.tool
 ```
 
 `examples/leak_refund_delete.json` 是一个**漏处理退款删除**的样例：增量 SQL 处理了
@@ -46,6 +62,81 @@ curl -s -X POST http://localhost:8000/v1/minimize \
 即：原本 6 个批次里只剩 2 个（101 插入退款、103 删除退款）；批次 101 无法删除，因为
 删掉后批次 103 的删除目标不存在，输入非法。`examples/correct_incremental.json` 是正确
 实现，返回 `no_difference`。
+
+## 净额成品发布与读取
+
+### 语义
+
+- **输入**：`initial`、`batches` 沿用上面的格式与批内合法性规则（主键唯一、改删对象
+  存在、每批之后外键成立）；`base_version` 是提交者看到的当前版本（首次发布为 `0`）；
+  `request_id` 是幂等键。
+- **计算**：按原顺序重放全部批次，得到最终源表；每个订单的净额为
+  `order.amount - SUM(该订单全部 refund.amount)`，按 `order_id` 升序输出整份成品。
+  退款金额与订单金额均为整数分，允许为负。
+- **不发布的情况**：输入非法（含批次重放失败）或任一净额超出有符号 64 位整数范围
+  `[-2^63, 2^63-1]`，返回 `422`。整个成品在内存中算完后才进入发布事务，因此不会出现
+  半份成品。
+- **版本发布**：在一个 SQLite 写事务中完成“校验所见版本仍是当前版本 → 版本号加一 →
+  写版本元数据 → 写成品的全部行 → 记录请求标识”。事务提交前任何失败都会回滚，
+  已有成品与请求记录保持不变。
+- **并发**：多个请求同时以同一 `base_version` 发布时，写锁保证只有一个事务成功；
+  其余请求事务内重新读取到新版本后返回 `409`。不会出现两个请求都发布“版本 N+1”。
+- **读取**：`/v1/products/current` 与 `/v1/products/{version}` 在同一个数据库快照中
+  读取版本号和该版本全部行，因此读者只会看到完整的旧版或完整的新版，不会看到半份成品。
+- **幂等**：同一 `request_id` 重送**相同内容**（`initial` 与 `batches` 相同）返回首次
+  发布版本，`replayed=true`，不再产生新版本；即使当前版本已经前进也一样。内容不同则
+  返回 `409`，首次发布的版本与成品不变。
+- **失败不记账**：非法输入、净额溢出、版本冲突、请求标识复用都不会写入请求记录；
+  失败后可以用同一 `request_id` 重试（例如带着最新 `base_version`）。因为失败的尝试
+  没有留下记录，重试时即使内容有变，也是作为一次全新请求处理；只有**已发布**过的
+  `request_id` 才会做“相同内容返回首次版本 / 不同内容拒绝”的判定。
+
+### 端点
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `POST` | `/v1/publish` | 重放并原子发布下一版本；`200` 返回版本号、`replayed`、整份成品 |
+| `GET` | `/v1/products/current` | 当前完整成品；尚未发布时 `404` |
+| `GET` | `/v1/products/{version}` | 指定版本的完整成品；不存在时 `404` |
+| `GET` | `/v1/products/versions` | 当前版本号与所有已发布版本元数据 |
+
+`POST /v1/publish` 请求：
+
+```jsonc
+{
+  "request_id": "publish-example-001",   // 1-128 位字母/数字/._:-
+  "base_version": 0,                     // 0 = 尚无已发布成品
+  "initial": {"orders": [...], "refunds": [...]},
+  "batches": [{"batch_id": 101, "changes": [...]}, ...]
+}
+```
+
+响应：
+
+```json
+{
+  "version": 1,
+  "replayed": false,
+  "row_count": 2,
+  "product": [
+    {"order_id": 1001, "net_amount": 3800},
+    {"order_id": 1002, "net_amount": 2700}
+  ]
+}
+```
+
+| 状态码 | 含义 |
+| --- | --- |
+| `422` | 输入非法或净额超出 64 位整数范围；未发布、未记录 |
+| `409` | 所见版本已失效，或 `request_id` 已用于不同内容；已有成品与请求记录不变 |
+| `503` | 发布存储暂时不可用（如磁盘错误）；事务已回滚 |
+
+### 持久化
+
+成品存放在 `PUBLISH_DB_PATH` 指向的 SQLite 文件（默认 `data/published.db`）。
+Docker Compose 把它设为 `/data/published.db` 并挂载命名卷 `published-data`；
+容器以只读根文件系统运行，`/data` 是唯一可写挂载点。SQLite 使用 WAL 与
+`busy_timeout=30s`，每个请求使用独立短连接，不跨线程共享连接。
 
 ## 数据模型与执行契约
 
@@ -146,14 +237,17 @@ curl -s -X POST http://localhost:8000/v1/minimize \
 
 ## 安全与隔离
 
-- 每次 `Executor.run` 新建内存数据库，连接不共享；FastAPI 同步端点在工作线程中运行，
-  并发请求之间没有共享的可变状态。测试 `test_concurrent_requests_are_isolated` 覆盖。
+- 反例精简的每次 `Executor.run` 新建内存数据库，连接不共享；FastAPI 同步端点在工作线程
+  中运行，并发请求之间没有共享的可变状态。测试 `test_concurrent_requests_are_isolated`
+  覆盖。
 - 双层防护：文本预检（语句数、首关键字、禁止词、写目标表）+ SQLite
   `set_authorizer`（表级读写权限、禁止 DDL/ATTACH/PRAGMA/事务控制）。
 - 资源限制：单语句 1 秒（progress handler 中断）、结果行数上限、数据库页上限、值长度
   上限、单请求总时限与最大试验次数。
-- 容器：非 root 用户、`read_only` 根文件系统、`tmpfs /tmp`、`cap_drop: ALL`、
-  `no-new-privileges`。
+- 发布存储：所有写入走参数化 SQL；版本切换是带 `WHERE current_version = ?` 的比较并
+  交换，并与成品行、请求记录同一事务提交。每个请求独立短连接，不共享游标。
+- 容器：非 root 用户、`read_only` 根文件系统、`tmpfs /tmp`、仅命名卷 `/data` 可写、
+  `cap_drop: ALL`、`no-new-privileges`。
 
 ## 可调参数（环境变量）
 
@@ -165,6 +259,7 @@ curl -s -X POST http://localhost:8000/v1/minimize \
 | `MAX_REQUEST_SECONDS` | `120` | 单请求总时限 |
 | `MAX_DB_PAGES` | `16384` | 每个试验库的页数上限 |
 | `MAX_VALUE_BYTES` | `1000000` | 单个值长度上限 |
+| `PUBLISH_DB_PATH` | `data/published.db` | 已发布净额成品的 SQLite 文件；Compose 中为 `/data/published.db` |
 
 ## 已知限制
 
@@ -174,20 +269,30 @@ curl -s -X POST http://localhost:8000/v1/minimize \
 - 缩减只针对批次层面；单个批次内部的多个 `change` 不会被拆开或删减。
 - SQLite 是单线程内存库；每次试验重建数据库，因此候选评估的成本与批次数、数据量成正比
   （数据上限 100 行、20 批，实测示例 9 次评估内完成）。
-- 不处理跨请求的持久化或任务队列；请求是同步完成的（超时受 `MAX_REQUEST_SECONDS` 约束）。
+- 反例精简请求是同步完成的（超时受 `MAX_REQUEST_SECONDS` 约束），不处理跨请求的持久化
+  或任务队列；只有成品发布使用持久化存储。
+- 发布存储使用 SQLite 单文件：适合单实例或低并发写入。多个**容器实例**共享同一文件
+  （例如把 NFS 卷同时挂给多副本）不在支持范围内；多副本部署应换用集中式数据库。
+- 发布接口不接受 SQL 字段：成品直接由重放后的源表计算，避免用提交的 SQL 决定成品内容。
+- 发布按“整份成品”覆盖式生成版本，不做按订单的增量差异存储；每个版本保存全部行。
+- 版本号只增不减，不提供删除/回滚接口。
+- 发布请求仍要求至少 1 个批次（与现有 API 一致）；“只改初态、不带变更”的发布不被接受。
 
 ## 目录结构
 
 ```
 app/
-  main.py       FastAPI 应用与端点
+  main.py       FastAPI 应用与端点（精简、发布、读取）
   models.py     Pydantic 请求/响应模型
   validate.py   初始数据与批次合法性、CDC 记录
   schema.py     SQLite 表结构与序列化
   sqlguard.py   SQL 策略（文本预检 + authorizer）
   executor.py   单次试验：重建库、逐批事务、多重集比较
   reducer.py    ddmin 缩减与最小性认证
+  publish.py    净额成品计算、int64 校验、请求内容指纹
+  store.py      已发布成品的持久化与版本并发控制
   config.py     环境变量配置
-tests/          92 个测试（校验、SQL 策略、SQL 形态、执行器、缩减器、API、契约）
-examples/       正确实现与漏删退款的反例
+tests/          117 个测试（校验、SQL 策略、SQL 形态、执行器、缩减器、API、契约、
+                发布/读取/幂等/并发/持久化）
+examples/       正确实现、漏删退款的反例、发布请求样例
 ```

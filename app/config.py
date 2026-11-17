@@ -45,3 +45,7 @@ MAX_DB_PAGES = _int("MAX_DB_PAGES", 16_384)
 
 #: Maximum accepted length of each submitted SQL string.
 MAX_SQL_CHARS = _int("MAX_SQL_CHARS", 100_000)
+
+#: SQLite file holding published net products.  In Docker Compose this lives
+#: on a named volume so products survive container recreation.
+PUBLISH_DB_PATH = os.environ.get("PUBLISH_DB_PATH", "data/published.db")

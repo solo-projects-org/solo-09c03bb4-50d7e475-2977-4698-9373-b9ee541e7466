@@ -1,17 +1,23 @@
-"""FastAPI application: incremental-net SQL minimizer.
+"""FastAPI application: incremental-net SQL minimizer and net-product publisher.
 
 Every request is handled synchronously and uses its own in-memory SQLite
 databases created by the :class:`~app.executor.Executor`.  No global mutable
 state, no temp files, no network access: a trial cannot affect another request
 (and FastAPI runs sync endpoints in a worker thread pool, so two requests can
 run concurrently without sharing a connection).
+
+The publish/read endpoints additionally use a small on-disk SQLite store
+(:mod:`app.store`) so a complete product survives restarts.  Publication is
+one SQLite transaction with a compare-and-set on the observed version.
 """
 
 from __future__ import annotations
 
+import sqlite3
+from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 
 from . import __version__, config
 from .executor import Executor
@@ -20,37 +26,51 @@ from .models import (
     DifferenceDetail,
     MinimizeRequest,
     MinimizeResponse,
+    ProductResponse,
+    PublishRequest,
+    PublishResponse,
     ValidateRequest,
     ValidateResponse,
+    VersionListResponse,
+)
+from .publish import (
+    NetAmountOutOfRange,
+    compute_net_product,
+    request_content_hash,
 )
 from .reducer import Reducer
 from .sqlguard import SqlPolicyError
+from .store import PublishStore, RequestIdReused, VersionConflict
 from .validate import InputError, validate_all
 
 app = FastAPI(
-    title="增量净额 SQL 反例精简器",
+    title="增量净额 SQL 反例精简器 / 净额成品发布",
     version=__version__,
     description=(
-        "给出 orders/refunds 初始数据（合计至多 100 行）、至多 20 批增删改变更、"
-        "全量 SELECT 与增量 SQL，服务在隔离的内存 SQLite 中从全量初始成品出发逐批重放，"
-        "每批事务提交后按**多重集**比较全量结果与增量 result 表（重复行计入），"
-        "首次发现差异后自动删减批次，返回精简输入、首次差异的原批号以及缺失/多余行。\n\n"
-        "**安全与判定边界**\n"
-        "- 全量 SQL 只读，只能访问 orders/refunds；增量 SQL 只能写 result。"
-        "两条 SQL 都由 SQLite authorizer 强制约束。\n"
-        "- 每个候选输入都在全新内存库中从相同初始状态重建，试验之间、请求之间互不影响。\n"
-        "- 任一语句报错、被策略拒绝、结果超过行数上限或单次执行超过 "
-        f"{config.STATEMENT_TIMEOUT_SECONDS:g} 秒，即标记为**无法判定**，"
-        "不能作为缩减完成的依据。\n"
-        "- 只有删除任一剩余批次都会使输入非法或消除差异时，才返回 "
-        "`reduced`/`already_minimal`。\n\n"
-        "**增量 SQL 可用的表**\n"
-        "`orders(order_id, amount)`、`refunds(refund_id, order_id, amount)`、"
-        "`batch_changes(...)`（本批前后值）、`result(order_id, net_amount)`。"
-        "`batch_changes` 的列定义见 README。"
+        "两部分能力：\n\n"
+        "1. **反例精简**（`/v1/minimize`、`/v1/validate`）：给出 orders/refunds "
+        "初始数据、至多 20 批增删改变更、全量 SELECT 与增量 SQL，在隔离的内存 "
+        "SQLite 中逐批重放，按多重集比较并缩减批次。\n"
+        "2. **净额成品发布与读取**（`/v1/publish`、`/v1/products/...`）：提交现有"
+        "格式的初态、顺序批次、所见发布版本和请求标识；服务沿用批内合法性规则重放，"
+        "逐订单计算 `订单金额 - 退款合计`，整份成品算完后以所见版本做原子比较并发布"
+        "下一版本。\n\n"
+        "**发布一致性**\n"
+        "- 净额超出 64 位整数范围或输入非法时**不发布**；失败不会改变已有成品或请求记录。\n"
+        "- 只有整份成品计算完成且所见版本仍是当前版本才持久发布；并发争同一版本只有"
+        "一个成功，另一个返回 409。\n"
+        "- 读取总是得到某个完整的旧版或新版（版本号与行在同一数据库快照中读取）。\n"
+        "- 同一 `request_id` 重送相同内容返回首次发布版本（`replayed=true`）；内容不同"
+        "返回 409；失败请求不记录，可用同一标识重试。"
     ),
     contact={"name": "结算数仓工具"},
 )
+
+
+def _publish_store() -> PublishStore:
+    # Resolved per call so tests and deployments can point PUBLISH_DB_PATH at
+    # a temp directory without import-time side effects.
+    return PublishStore(Path(config.PUBLISH_DB_PATH))
 
 
 @app.get("/health", summary="健康检查", tags=["运维"])
@@ -62,6 +82,7 @@ def health() -> dict[str, Any]:
         "max_result_rows": config.MAX_RESULT_ROWS,
         "max_trials": config.MAX_TRIALS,
         "max_request_seconds": config.MAX_REQUEST_SECONDS,
+        "publish_db_path": str(config.PUBLISH_DB_PATH),
     }
 
 
@@ -97,7 +118,7 @@ def minimize(request: MinimizeRequest) -> MinimizeResponse:
         outcome = Reducer(request.initial, request.batches, executor).run()
     except InputError as exc:  # pragma: no cover - validated above
         raise HTTPException(status_code=422, detail=f"输入非法: {exc}") from exc
-    except SqlPolicyError as exc:
+    except SqlPolicyError as exc:  # pragma: no cover - validated above
         raise HTTPException(status_code=422, detail=f"SQL 不符合策略: {exc}") from exc
 
     difference = None
@@ -143,4 +164,135 @@ def validate(request: ValidateRequest) -> ValidateResponse:
         first_difference_batch_id=batch_id,
         difference=difference,
         notes=result.notes,
+    )
+
+
+@app.post(
+    "/v1/publish",
+    response_model=PublishResponse,
+    summary="重放变更并原子发布下一版净额成品",
+    tags=["成品"],
+    responses={
+        409: {
+            "description": (
+                "所见版本已失效（他人已发布），或同一请求标识被用于不同内容；"
+                "已有成品与请求记录不变"
+            )
+        },
+        422: {"description": "输入非法或净额超出 64 位整数范围；不发布任何内容"},
+    },
+)
+def publish(request: PublishRequest) -> PublishResponse:
+    try:
+        product = compute_net_product(request.initial, request.batches)
+    except InputError as exc:
+        raise HTTPException(status_code=422, detail=f"输入非法: {exc}") from exc
+    except NetAmountOutOfRange as exc:
+        raise HTTPException(
+            status_code=422, detail=f"净额超出 64 位整数范围: {exc}"
+        ) from exc
+
+    content_hash = request_content_hash(request.initial, request.batches)
+    store = _publish_store()
+    try:
+        outcome = store.publish(
+            base_version=request.base_version,
+            request_id=request.request_id,
+            content_hash=content_hash,
+            product=product,
+        )
+    except VersionConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except RequestIdReused as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except sqlite3.Error as exc:
+        raise HTTPException(
+            status_code=503, detail=f"发布存储暂不可用，未改变已有成品: {exc}"
+        ) from exc
+
+    return PublishResponse(
+        version=outcome.version,
+        replayed=outcome.replayed,
+        row_count=len(outcome.product),
+        product=[
+            {"order_id": row.order_id, "net_amount": row.net_amount}
+            for row in outcome.product
+        ],
+    )
+
+
+@app.get(
+    "/v1/products/current",
+    response_model=ProductResponse,
+    summary="读取当前完整成品",
+    tags=["成品"],
+    responses={404: {"description": "尚未发布任何版本"}},
+)
+def get_current_product() -> ProductResponse:
+    return _read_product(None)
+
+
+@app.get(
+    "/v1/products/versions",
+    response_model=VersionListResponse,
+    summary="列出已发布版本",
+    tags=["成品"],
+)
+def list_versions() -> VersionListResponse:
+    store = _publish_store()
+    try:
+        current, versions = store.version_overview()
+    except sqlite3.Error as exc:
+        raise HTTPException(
+            status_code=503, detail=f"发布存储暂不可用: {exc}"
+        ) from exc
+    return VersionListResponse(
+        current_version=current,
+        versions=[
+            {
+                "version": info.version,
+                "request_id": info.request_id,
+                "row_count": info.row_count,
+                "published_at": info.published_at,
+            }
+            for info in versions
+        ],
+    )
+
+
+@app.get(
+    "/v1/products/{version}",
+    response_model=ProductResponse,
+    summary="按版本号读取完整成品",
+    tags=["成品"],
+    responses={404: {"description": "该版本不存在"}},
+)
+def get_product_by_version(version: int) -> ProductResponse:
+    return _read_product(version)
+
+
+def _read_product(version: int | None) -> ProductResponse:
+    store = _publish_store()
+    try:
+        snapshot = store.get_product(version)
+    except sqlite3.Error as exc:
+        raise HTTPException(
+            status_code=503, detail=f"发布存储暂不可用: {exc}"
+        ) from exc
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="成品版本不存在")
+    return ProductResponse(
+        version=snapshot["version"],  # type: ignore[arg-type]
+        request_id=snapshot["request_id"],  # type: ignore[arg-type]
+        row_count=snapshot["row_count"],  # type: ignore[arg-type]
+        published_at=snapshot["published_at"],  # type: ignore[arg-type]
+        product=snapshot["rows"],  # type: ignore[arg-type]
+    )
+
+
+@app.get("/", include_in_schema=False)
+def root() -> Response:
+    return Response(
+        content='{"service":"incremental-net","docs":"/docs"}',
+        media_type="application/json",
     )

@@ -1,0 +1,90 @@
+{
+  "request_id": "publish-example-001",
+  "base_version": 0,
+  "initial": {
+    "orders": [
+      {
+        "order_id": 1001,
+        "amount": 5000
+      },
+      {
+        "order_id": 1002,
+        "amount": 3000
+      }
+    ],
+    "refunds": [
+      {
+        "refund_id": 9001,
+        "order_id": 1001,
+        "amount": 1200
+      }
+    ]
+  },
+  "batches": [
+    {
+      "batch_id": 101,
+      "changes": [
+        {
+          "op": "insert",
+          "table": "refunds",
+          "after": {
+            "refund_id": 9002,
+            "order_id": 1001,
+            "amount": 500
+          }
+        }
+      ]
+    },
+    {
+      "batch_id": 102,
+      "changes": [
+        {
+          "op": "insert",
+          "table": "orders",
+          "after": {
+            "order_id": 1003,
+            "amount": 800
+          }
+        }
+      ]
+    },
+    {
+      "batch_id": 103,
+      "changes": [
+        {
+          "op": "delete",
+          "table": "refunds",
+          "before": {
+            "refund_id": 9002
+          }
+        }
+      ]
+    },
+    {
+      "batch_id": 104,
+      "changes": [
+        {
+          "op": "insert",
+          "table": "refunds",
+          "after": {
+            "refund_id": 9003,
+            "order_id": 1002,
+            "amount": 300
+          }
+        }
+      ]
+    },
+    {
+      "batch_id": 105,
+      "changes": [
+        {
+          "op": "delete",
+          "table": "orders",
+          "before": {
+            "order_id": 1003
+          }
+        }
+      ]
+    }
+  ]
+}
